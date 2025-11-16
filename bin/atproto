@@ -66,6 +66,15 @@ Commands:
     feeds [handle]      List available feed generators
     follow <handle>     Follow a user
     unfollow <handle>   Unfollow a user
+    unfollow-no-follows  Unfollow users who don't follow you back (bulk operation)
+        Options for unfollow-no-follows:
+            --dry-run (default)    Preview unfollow candidates without taking action
+            --no-dry-run           Execute unfollows
+            -y, --yes              Skip interactive confirmation when executing
+            --throttle <seconds>   Wait between unfollows to avoid rate-limits (default 0.4)
+            --limit <N>            Limit number of unfollows to attempt
+            --report-file <file>   Write a report CSV with each processed user (did,handle,action,result,timestamp)
+            --resume               When used with --report-file, skip entries already present in the report
     followers [handle]  View followers (defaults to current user)
     following [handle]  View following (defaults to current user)
     search <query>      Search for posts
@@ -118,6 +127,8 @@ Examples:
     atproto --json feed 10           # Read timeline (JSON output)
     atproto follow user.bsky.social  # Follow a user
     atproto unfollow user.bsky.social # Unfollow a user
+    atproto unfollow-no-follows --dry-run --limit 50  # Dry run: list users we would unfollow
+    atproto unfollow-no-follows --no-dry-run -y --throttle 0.5  # Execute unfollows with throttle
     atproto followers                # View your followers
     atproto followers user.bsky.social # View another user's followers
     atproto --json followers 50      # View followers (JSON, limit 50)
@@ -441,6 +452,10 @@ main() {
                 exit 1
             fi
             atproto_unfollow "$@"
+            ;;
+        unfollow-no-follows)
+            shift
+            atproto_unfollow_no_follows "$@"
             ;;
         search)
             shift

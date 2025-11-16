@@ -22,136 +22,157 @@ else
     exit 1
 fi
 
-# Source encryption library
-if [ -f "$SCRIPT_DIR/crypt.sh" ]; then
-    source "$SCRIPT_DIR/crypt.sh"
-else
-    echo "Error: crypt.sh not found in $SCRIPT_DIR" >&2
-    exit 1
-fi
-
-# Source validation library
-if [ -f "$SCRIPT_DIR/validation.sh" ]; then
-    source "$SCRIPT_DIR/validation.sh"
-else
-    echo "Error: validation.sh not found in $SCRIPT_DIR" >&2
-    exit 1
-fi
-
-# Get configuration value with fallback chain:
-# 1. Environment variable (highest priority)
-# 2. Config file
-# 3. Default value (lowest priority)
-get_config_value() {
-    local key="$1"
-    local env_var="$2"
-    local default="$3"
-    
-    # Check environment variable first
-    if [ -n "$env_var" ] && [ -n "${!env_var}" ]; then
-        echo "${!env_var}"
-        return 0
-    fi
-    
-    # Try config file if config.sh is sourced
-    if type get_config >/dev/null 2>&1; then
+    # Read user input securely
+    read_secure() {
+        local prompt="$1"
+        local var_name="$2"
         local value
-        value=$(get_config "$key" 2>/dev/null)
-        if [ -n "$value" ]; then
-            echo "$value"
-            return 0
-        fi
-    fi
-    
-    # Fall back to default
-    echo "$default"
-}
 
-# Initialize configuration values
-# These can be overridden by environment variables or config file
-ATP_PDS=$(get_config_value "pds_endpoint" "ATP_PDS" "https://bsky.social")
-DEBUG=$(get_config_value "debug" "DEBUG" "0")
-DEFAULT_FEED_LIMIT=$(get_config_value "feed_limit" "ATP_FEED_LIMIT" "10")
-DEFAULT_SEARCH_LIMIT=$(get_config_value "search_limit" "ATP_SEARCH_LIMIT" "10")
-
-# Note: Color definitions and logging functions (error, success, warning, debug)
-# are now provided by lib/reporter.sh which is sourced above
-
-# Check if JSON output format is enabled
-is_json_output() {
-    local format
-    format=$(get_config_value "output_format" "ATP_OUTPUT_FORMAT" "text")
-    [ "$format" = "json" ]
-}
-
-# Output data in JSON format
-# Arguments:
-#   $1 - JSON data to output
-json_output() {
-    local data="$1"
-    if is_json_output; then
-        echo "$data"
-    fi
-}
-
-# Output data in text format (with optional color)
-# Arguments:
-#   $1 - text to output
-#   $2 - optional color code
-text_output() {
-    local text="$1"
-    local color="${2:-}"
-    
-    if ! is_json_output; then
-        if [ -n "$color" ]; then
-            echo -e "${color}${text}${NC}"
+        if [ -t 0 ]; then
+            read -r -p "$prompt" value
         else
-            echo "$text"
+            error "Cannot read from non-interactive terminal"
+            return 1
+        fi
+
+        # Use printf to safely assign the value
+        printf -v "$var_name" '%s' "$value"
+    }
+
+    # Read password securely
+    read_password() {
+        local prompt="$1"
+        local var_name="$2"
+        local value
+
+        if [ -t 0 ]; then
+            read -r -s -p "$prompt" value
+            echo >&2
+        else
+            error "Cannot read password from non-interactive terminal"
+            return 1
+        fi
+
+        # Use printf to safely assign the value
+        printf -v "$var_name" '%s' "$value"
+    }
+atproto_upload_blob() {
+    local file_path="$1"
+
+    if [ -z "$file_path" ]; then
+        error "File path is required"
+        return 1
+    fi
+
+    if [ ! -f "$file_path" ]; then
+        error "File not found: $file_path"
+        return 1
+    fi
+
+    if [ ! -f "$SESSION_FILE" ]; then
+        error "Not logged in. Run 'atproto login' first."
+        return 1
+    fi
+
+    # Get access token
+    local access_token session_data response
+    session_data=$(cat "$SESSION_FILE")
+    access_token=$(json_get_field "$session_data" "accessJwt")
+
+    if [ -z "$access_token" ]; then
+        error "Invalid session data"
+        return 1
+    fi
+
+    # Detect MIME type
+    local mime_type
+    case "${file_path##*.}" in
+        jpg|jpeg)
+            mime_type="image/jpeg"
+            ;;
+        png)
+            mime_type="image/png"
+            ;;
+        gif)
+            mime_type="image/gif"
+            ;;
+        webp)
+            mime_type="image/webp"
+            ;;
+        mp4)
+            mime_type="video/mp4"
+            ;;
+        *)
+            error "Unsupported file type. Supported: jpg, png, gif, webp, mp4"
+            return 1
+            ;;
+    esac
+
+    # Check file size
+    local file_size
+    file_size=$(wc -c < "$file_path")
+
+    # Size limits: 1MB for images, 50MB for videos
+    local max_size
+    if [[ "$mime_type" == image/* ]]; then
+        max_size=1048576  # 1MB
+        if [ "$file_size" -gt "$max_size" ]; then
+            error "Image file too large. Maximum size is 1MB ($(( max_size / 1024 ))KB)"
+            return 1
+        fi
+    elif [[ "$mime_type" == video/* ]]; then
+        max_size=52428800  # 50MB
+        if [ "$file_size" -gt "$max_size" ]; then
+            error "Video file too large. Maximum size is 50MB"
+            return 1
         fi
     fi
-}
 
-# Encryption functions have been moved to lib/crypt.sh
-# The following functions are now provided by lib/crypt.sh:
-#   - generate_or_get_key() (replaces get_encryption_key)
-#   - encrypt_data(plaintext, [password])
-#   - decrypt_data(ciphertext, [password])
-#
-# For full encryption API documentation, see doc/ENCRYPTION.md
+    debug "Uploading blob: $file_path ($mime_type, $(( file_size / 1024 ))KB)"
 
-# Read user input securely
-read_secure() {
-    local prompt="$1"
-    local var_name="$2"
-    local value
-    
-    if [ -t 0 ]; then
-        read -r -p "$prompt" value
-    else
-        error "Cannot read from non-interactive terminal"
+    # Upload blob using curl (binary data)
+    response=$(curl -s -X POST \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Type: $mime_type" \
+        --data-binary "@$file_path" \
+        "$ATP_PDS/xrpc/com.atproto.repo.uploadBlob")
+
+    # Check for errors
+    if echo "$response" | grep -q '"error"'; then
+        local error_msg
+        error_msg=$(json_get_field "$response" "message")
+        if [ -z "$error_msg" ]; then
+            error_msg="Unknown error"
+        fi
+        error "Blob upload failed: $error_msg"
         return 1
     fi
-    
-    # Use printf to safely assign the value
-    printf -v "$var_name" '%s' "$value"
-}
 
-# Read password securely
-read_password() {
-    local prompt="$1"
-    local var_name="$2"
-    local value
-    
-    if [ -t 0 ]; then
-        read -r -s -p "$prompt" value
-        echo >&2
-    else
-        error "Cannot read password from non-interactive terminal"
+    # Extract blob reference
+    local blob_ref blob_type blob_size blob_mime_type
+    blob_ref=$(echo "$response" | grep -o '"blob"[^}]*"ref"[^}]*"\$link":"[^"]*"' | grep -o '"\$link":"[^"]*"' | cut -d'"' -f4)
+    blob_type=$(echo "$response" | grep -o '"\$type":"[^"]*"' | head -1 | cut -d'"' -f4)
+    blob_size=$(json_get_field "$response" "size")
+    blob_mime_type=$(json_get_field "$response" "mimeType")
+
+    if [ -z "$blob_ref" ]; then
+        error "Failed to extract blob reference from response"
         return 1
     fi
-    
-    # Use printf to safely assign the value
-    printf -v "$var_name" '%s' "$value"
+
+    debug "Blob uploaded successfully: $blob_ref"
+
+    # Return blob reference in format needed for embedding
+    cat << EOF
+{
+  "\$type": "$blob_type",
+  "ref": {
+    "\$link": "$blob_ref"
+  },
+  "mimeType": "$blob_mime_type",
+  "size": $blob_size
+}
+EOF
 }
 
 # Make API request
@@ -2753,18 +2774,442 @@ atproto_get_followers() {
 # Outputs:
 #   Following list in formatted text
 atproto_get_following() {
-    local actor="${1:-}"
-    local limit="${2:-50}"
-    
-    # Get access token
-    local access_token
-    access_token=$(get_access_token) || {
-        error "Not logged in. Use 'atproto login' first."
-        return 1
+
+# Helper: fetch paginated list of handles or dids for a resource
+# Arguments:
+#   $1 - endpoint base (e.g., /xrpc/app.bsky.graph.getFollows?actor=...)
+#   $2 - key in JSON for the list (e.g., 'follows' or 'followers')
+#   $3 - output type: 'handle' or 'did' or 'both' (did<TAB>handle pairs)
+# Returns:
+#   newline-separated list on stdout
+fetch_paginated_list() {
+    local endpoint_base="$1"
+    local list_key="$2"
+    local out_type="${3:-handle}"
+        local cursor=""
+        local access_token
+        access_token=$(get_access_token) || {
+            error "Not logged in. Use 'atproto login' first."
+            return 1
+        }
+
+        while true; do
+            local endpoint="$endpoint_base"
+            if [ -n "$cursor" ]; then
+                endpoint="$endpoint&cursor=$cursor"
+            fi
+            debug "Fetching page: $endpoint"
+            local response
+            response=$(api_request GET "$endpoint" "" "$access_token") || return 1
+            # Extract items and cursor without printing cursor to stdout
+            python3 - <<PY 2>/dev/null
+import sys,json
+resp=json.loads(sys.stdin.read())
+items=resp.get('$list_key', [])
+for it in items:
+            if '$out_type' == 'did':
+                print(it.get('did'))
+            elif '$out_type' == 'handle':
+                print(it.get('handle'))
+            else:
+                # both: print did <TAB> handle
+                h = it.get('handle') or ''
+                d = it.get('did') or ''
+                print(f"{d}\t{h}")
+sys.stdout.flush()
+cursor = resp.get('cursor')
+if cursor:
+    # Print cursor to stderr so it doesn't mix with items
+    print(cursor, file=sys.stderr)
+PY <<< "$response"
+
+            # Capture cursor from stderr (if any)
+                    local lastline
+            lastline=$(python3 - <<PY 2>/dev/null
+import sys,json
+resp=json.loads(sys.stdin.read())
+print(resp.get('cursor') or '')
+PY <<< "$response")
+            if [ -n "$lastline" ]; then
+                cursor="$lastline"
+                # Remove printed cursor value from output by continuing loop
+                # but we simply continue fetching pages, the printed handles remain
+            else
+                break
+            fi
+        done
+
+        return 0
     }
+
+# Build map of follow records: DID -> rkey
+build_follow_record_map() {
+    local repo session_data access_token
+    session_data=$(cat "$SESSION_FILE")
+        repo=$(json_get_field "$session_data" "did")
+        access_token=$(get_access_token) || {
+            error "Not logged in. Use 'atproto login' first."
+            return 1
+        }
+
+        local cursor=""
+        while true; do
+            local endpoint="/xrpc/com.atproto.repo.listRecords?repo=$repo&collection=app.bsky.graph.follow&limit=100"
+            if [ -n "$cursor" ]; then
+                endpoint="$endpoint&cursor=$cursor"
+            fi
+            local response
+            response=$(api_request GET "$endpoint" "" "$access_token") || return 1
+
+            python3 - <<PY 2>/dev/null
+import sys,json
+resp=json.loads(sys.stdin.read())
+for rec in resp.get('records',[]):
+    rkey = rec.get('rkey') or (rec.get('uri') or '').split('/')[-1]
+    did = rec.get('value', {}).get('subject', {}).get('did') or ''
+    if did and rkey:
+        print(did + '\t' + rkey)
+if resp.get('cursor'):
+    print(resp.get('cursor'), file=sys.stderr)
+PY <<< "$response"
+
+            cursor=$(python3 - <<PY 2>/dev/null
+import sys,json
+resp=json.loads(sys.stdin.read())
+print(resp.get('cursor') or '')
+PY <<< "$response")
+
+            if [ -z "$cursor" ]; then
+                break
+            fi
+    done
+    return 0
+}
+
+# Generate list of users we follow who don't follow us back
+# Arguments:
+#   $1 - output file (optional, default: remove_list.txt)
+#   $2 - format: handle|did (optional, default: handle)
+#   $3 - limit per page (optional, default: 100)
+atproto_generate_unfollow_list() {
+    local output_file="${1:-remove_list.txt}"
+    local out_type="${2:-handle}"
+        local per_page="${3:-100}"
+
+        # Validate output type
+        if [ "$out_type" != "handle" ] && [ "$out_type" != "did" ]; then
+            error "Invalid format: $out_type. Must be 'handle' or 'did'"
+            return 1
+        fi
+
+        # Resolve actor (current user DID)
+        local actor
+        actor=$(get_session_did) || {
+            error "Failed to determine session DID. Please login."
+            return 1
+        }
+
+        info "Fetching following and followers for: $actor"
+
+        # Build endpoints
+        local followers_endpoint="/xrpc/app.bsky.graph.getFollowers?actor=$actor&limit=$per_page"
+        local following_endpoint="/xrpc/app.bsky.graph.getFollows?actor=$actor&limit=$per_page"
+
+        # Fetch lists (paginated)
+        local followers_list following_list
+        followers_list=$(fetch_paginated_list "$followers_endpoint" "followers" "did") || return 1
+        following_list=$(fetch_paginated_list "$following_endpoint" "follows" "both") || return 1
+
+        # Now compute difference: following_list - followers_list
+        printf '%s\n\nFOLLOWING\n\n%s\n' "$followers_list" "$following_list" | python3 - <<PY > "$output_file"
+import sys
+follows=sys.stdin.read().strip().split('\n\nFOLLOWING\n')
+raw_followers=follows[0] if len(follows)>=1 else ''
+raw_following=follows[1] if len(follows)>=2 else ''
+followers=[l.strip() for l in raw_followers.split('\n') if l.strip()]
+following=[l.strip() for l in raw_following.split('\n') if l.strip()]
+unfollowers=[u for u in following if u not in followers]
+for u in unfollowers:
+    print(u)
+PY
     
-    # If no actor specified, get current user's DID
-    if [ -z "$actor" ]; then
+    local count
+    count=$(wc -l < "$output_file" | tr -d ' ')
+    success "Unfollow list generated: $output_file ($count users)"
+    return 0
+}
+
+# Unfollow users who don't follow back
+# Arguments:
+#   --dry-run (default: true) - if specified, do not actually unfollow
+#   --yes/-y - automatically confirm unfollows
+#   --throttle <seconds> - seconds to sleep between unfollows (default 0.4)
+#   --limit <number> - limit for number of unfollows to attempt (for testing)
+#   --report-file <path> - path to CSV file for logging operations
+#   --resume - skip entries already in report file
+atproto_unfollow_no_follows() {
+    local dry_run=1 yes=0 throttle=0.4 limit=0
+    local report_file="" resume=0
+        local repo session_data access_token
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --dry-run)
+                    dry_run=1; shift;;
+                --no-dry-run|--exec)
+                    dry_run=0; shift;;
+                --report-file)
+                    report_file="$2"; shift 2;;
+                --resume)
+                    resume=1; shift;;
+                -y|--yes)
+                    yes=1; shift;;
+                --throttle)
+                    throttle="$2"; shift 2;;
+                --limit)
+                    limit="$2"; shift 2;;
+                --help)
+                    echo "Usage: atproto unfollow-no-follows [--dry-run] [--no-dry-run|--exec] [--limit N] [--throttle SECONDS] [-y|--yes]"; return 0;;
+                *)
+                    echo "Unknown option: $1" >&2; return 1;;
+            esac
+        done
+
+        # Resolve repo DID
+        local session_data repo access_token
+        session_data=$(cat "$SESSION_FILE")
+        repo=$(json_get_field "$session_data" "did")
+        access_token=$(get_access_token) || {
+            error "Not logged in. Use 'atproto login' first."; return 1
+        }
+
+        info "Building followers and following lists..."
+
+        # Fetch followers (DIDs)
+        local followers
+        mapfile -t followers < <(fetch_paginated_list "/xrpc/app.bsky.graph.getFollowers?actor=$repo&limit=100" "followers" "did") || return 1
+
+        # Fetch following (DID and handle)
+        local following_lines
+        mapfile -t following_lines < <(fetch_paginated_list "/xrpc/app.bsky.graph.getFollows?actor=$repo&limit=100" "follows" "both") || return 1
+
+        # Build follower set
+        declare -A follower_set
+        for d in "${followers[@]}"; do
+            [ -n "$d" ] || continue
+            follower_set["$d"]=1
+        done
+
+        # Build following array (did,handle)
+        declare -a following_dids following_handles
+        local handle did rkey delete_data response
+        for line in "${following_lines[@]}"; do
+            [ -z "$line" ] && continue
+            # line: did<TAB>handle
+            local did h
+            did=$(printf '%s' "$line" | cut -f1)
+            h=$(printf '%s' "$line" | cut -f2)
+            following_dids+=("$did")
+            following_handles+=("$h")
+        done
+
+        # Build map of rkeys
+        info "Building follow record map (DID -> rkey) ..."
+        declare -A rkey_map
+        while IFS=$'\t' read -r did rkey; do
+            [ -n "$did" ] && rkey_map["$did"]="$rkey"
+        done < <(build_follow_record_map)
+
+        # Build list of candidates (we follow them but they don't follow back)
+        local total_candidates=0
+        declare -a candidates_dids candidates_handles
+        local idx=0
+        for did in "${following_dids[@]}"; do
+            handle="${following_handles[$idx]}"
+            idx=$((idx + 1))
+            if [ -z "$did" ]; then
+                continue
+            fi
+            if [ -z "${follower_set[$did]}" ]; then
+                candidates_dids+=("$did")
+                candidates_handles+=("$handle")
+                total_candidates=$((total_candidates + 1))
+                if [ "$limit" -gt 0 ] && [ "$total_candidates" -ge "$limit" ]; then
+                    break
+                fi
+            fi
+        done
+
+        info "Found $total_candidates users to unfollow (not following back)"
+        if [ "$total_candidates" -eq 0 ]; then
+            info "No users to unfollow"
+            return 0
+        fi
+
+        # Prepare report/resume logic
+        declare -A processed_map
+        if [ -n "$report_file" ]; then
+            mkdir -p "$(dirname "$report_file")" 2>/dev/null || true
+            if [ ! -f "$report_file" ]; then
+                # create with header
+                echo "did,handle,action,result,timestamp" > "$report_file"
+            fi
+            if [ "$resume" -eq 1 ]; then
+                while IFS=, read -r pdid ph paction presult pts; do
+                    [ "$pdid" != "did" ] && processed_map["$pdid"]=1
+                done < "$report_file"
+            fi
+        fi
+
+        if [ "$dry_run" -eq 1 ]; then
+            info "Dry run enabled. No unfollow operations will be performed. Use --no-dry-run or --exec to execute."
+        fi
+
+        if [ "$dry_run" -eq 0 ] && [ "$yes" -ne 1 ]; then
+            read -r -p "Proceed to unfollow $total_candidates users? (y/N): " confirmation
+            if [ "$confirmation" != "y" ] && [ "$confirmation" != "Y" ]; then
+                info "Cancelled by user"
+                return 0
+            fi
+        fi
+
+        # Start processing with progress bar
+        local total="$total_candidates"
+        local succeeded=0 failed=0 skipped=0 done_count=0
+        local avg_time=0
+        local start_time overall_start
+        overall_start=$(date +%s)
+
+        for i in "${!candidates_dids[@]}"; do
+            did="${candidates_dids[$i]}"
+            handle="${candidates_handles[$i]}"
+            # Skip if resume and processed_map has this DID
+            if [ "$resume" -eq 1 ] && [ -n "${processed_map[$did]}" ]; then
+                done_count=$((done_count + 1))
+                skipped=$((skipped + 1))
+                continue
+            fi
+            # If empty DID, skip
+            if [ -z "$did" ]; then
+                skipped=$((skipped + 1))
+                continue
+            fi
+
+            start_time_iter=$(date +%s)
+
+            # Determine rkey
+            rkey="${rkey_map[$did]}"
+            local unfollow_ok=0
+
+            if [ -n "$rkey" ]; then
+                # Delete record directly
+                if [ "$dry_run" -eq 0 ]; then
+                    delete_data=$(cat <<EOF
+    {
+      "repo": "$repo",
+      "collection": "app.bsky.graph.follow",
+      "rkey": "$rkey"
+    }
+    EOF
+    )
+                    response=$(api_request POST "/xrpc/com.atproto.repo.deleteRecord" "$delete_data" "$access_token") || true
+                    local action="delete-by-rkey" result=""
+                    if echo "$response" | grep -q '"error"'; then
+                        failed=$((failed + 1))
+                        result="error"
+                        debug "Failed to unfollow $handle ($did): $response"
+                    else
+                        succeeded=$((succeeded + 1))
+                        result="success"
+                        unfollow_ok=1
+                    fi
+                    # Append to report file if requested
+                    if [ -n "$report_file" ]; then
+                        ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                        printf '"%s","%s","%s","%s","%s"\n' "$did" "$handle" "$action" "$result" "$ts" >> "$report_file"
+                    fi
+                else
+                    # Dry run: just print
+                    echo "[DRY-RUN] Would unfollow: $handle ($did)"
+                    if [ -n "$report_file" ]; then
+                        ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                        printf '"%s","%s","%s","%s","%s"\n' "$did" "$handle" "delete-by-rkey" "planned" "$ts" >> "$report_file"
+                    fi
+                fi
+            else
+                # Fallback to regular atproto_unfollow (resolves by handle)
+                if [ -n "$handle" ]; then
+                    if [ "$dry_run" -eq 0 ]; then
+                        atproto_unfollow "$handle" || { failed=$((failed + 1)); continue; }
+                        succeeded=$((succeeded + 1))
+                        unfollow_ok=1
+                        if [ -n "$report_file" ]; then
+                            ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                            printf '"%s","%s","%s","%s","%s"\n' "$did" "$handle" "unfollow-by-handle" "success" "$ts" >> "$report_file"
+                        fi
+                    else
+                        echo "[DRY-RUN] Would unfollow: $handle ($did)"
+                        if [ -n "$report_file" ]; then
+                            ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                            printf '"%s","%s","%s","%s","%s"\n' "$did" "$handle" "unfollow-by-handle" "planned" "$ts" >> "$report_file"
+                        fi
+                    fi
+                else
+                    warning "No handle and no rkey for DID: $did - skipping"
+                    skipped=$((skipped + 1))
+                fi
+            fi
+
+            done_count=$((done_count + 1))
+            end_time_iter=$(date +%s)
+            local elapsed
+            elapsed=$((end_time_iter - start_time_iter))
+            if [ $elapsed -le 0 ]; then elapsed=1; fi
+            if [ $done_count -eq 1 ]; then
+                avg_time=$elapsed
+            else
+                avg_time=$(( (avg_time*(done_count-1) + elapsed) / done_count ))
+            fi
+
+            local remaining=$((total - done_count))
+            local eta=$((avg_time * remaining))
+            local hh=$((eta / 3600))
+            local mm=$(((eta % 3600) / 60))
+            local ss=$((eta % 60))
+            # Progress bar
+            local width=40
+            local filled=$((done_count * width / total))
+            local unfilled=$((width - filled))
+            local bar
+            if [ "$filled" -gt 0 ]; then
+                printf -v bar '%*s' "$filled" ''
+                bar=${bar// /#}
+            else
+                bar=""
+            fi
+            local unbar
+            if [ "$unfilled" -gt 0 ]; then
+                printf -v unbar '%*s' "$unfilled" ''
+                unbar=${unbar// /-}
+            else
+                unbar=""
+            fi
+            bar="$bar$unbar"
+            printf '\rProgress: %d/%d [%s] %d%% ETA: %02d:%02d:%02d Succeeded:%d Failed:%d Skipped:%d' \
+                "$done_count" "$total" "$bar" $(((done_count * 100) / total)) $hh $mm $ss $succeeded $failed $skipped
+
+            # Throttle between operations
+            if [ "$dry_run" -eq 0 ] && awk "BEGIN{exit !($throttle > 0)}"; then
+                sleep "$throttle"
+            fi
+        done
+        printf '\n'
+
+        local overall_end
+        overall_end=$(date +%s)
+        local total_time=$((overall_end - overall_start))
+        success "Completed unfollow-no-follows: Total:$total Processed:$done_count Succeeded:$succeeded Failed:$failed Skipped:$skipped Time:${total_time}s"
+        return 0
+    }
         actor=$(get_session_did)
         if [ -z "$actor" ]; then
             error "Could not determine current user"
@@ -2829,286 +3274,5 @@ atproto_get_following() {
     echo -e "${BLUE}Total:${NC} $count following"
     echo ""
     
-    return 0
-}
-# New functions for unfollow-no-follows feature (v2 - using python3 -c pattern)
-
-# Helper: fetch paginated list
-fetch_paginated_list() {
-    local endpoint_base="$1"
-    local list_key="$2"
-    local out_type="${3:-handle}"
-    local cursor=""
-    local access_token
-    access_token=$(get_access_token) || return 1
-
-    while true; do
-        local endpoint="$endpoint_base"
-        [ -n "$cursor" ] && endpoint="$endpoint&cursor=$cursor"
-        
-        local response
-        response=$(api_request GET "$endpoint" "" "$access_token") || return 1
-
-        # Output based on type
-        if [ "$out_type" = "both" ]; then
-            echo "$response" | python3 -c "
-import sys, json
-resp = json.loads(sys.stdin.read())
-for item in resp.get('$list_key', []):
-    did, handle = item.get('did', ''), item.get('handle', '')
-    if did and handle: print(f'{did}\t{handle}')
-"
-        elif [ "$out_type" = "did" ]; then
-            echo "$response" | python3 -c "
-import sys, json
-resp = json.loads(sys.stdin.read())
-for item in resp.get('$list_key', []): 
-    if item.get('did'): print(item['did'])
-"
-        else
-            echo "$response" | python3 -c "
-import sys, json
-resp = json.loads(sys.stdin.read())
-for item in resp.get('$list_key', []): 
-    if item.get('handle'): print(item['handle'])
-"
-        fi
-
-        # Check for cursor
-        cursor=$(echo "$response" | python3 -c "
-import sys, json
-resp = json.loads(sys.stdin.read())
-print(resp.get('cursor', ''))
-" 2>/dev/null)
-
-        [ -z "$cursor" ] && break
-    done
-    return 0
-}
-
-# Build map of follow records: DID -> rkey
-build_follow_record_map() {
-    local repo session_data access_token
-    session_data=$(cat "$SESSION_FILE")
-    repo=$(json_get_field "$session_data" "did")
-    access_token=$(get_access_token) || {
-        error "Not logged in. Use 'atproto login' first."
-        return 1
-    }
-
-    local cursor=""
-    while true; do
-        local endpoint="/xrpc/com.atproto.repo.listRecords?repo=$repo&collection=app.bsky.graph.follow&limit=100"
-        if [ -n "$cursor" ]; then
-            endpoint="$endpoint&cursor=$cursor"
-        fi
-        local response
-        response=$(api_request GET "$endpoint" "" "$access_token") || return 1
-
-        echo "$response" | python3 -c "
-import sys, json
-resp = json.loads(sys.stdin.read())
-for rec in resp.get('records', []):
-    rkey = rec.get('uri', '').split('/')[-1] if rec.get('uri') else ''
-    did = rec.get('value', {}).get('subject', '')
-    if did and rkey:
-        print(did + '\t' + rkey)
-"
-
-        cursor=$(echo "$response" | python3 -c "
-import sys, json
-resp = json.loads(sys.stdin.read())
-print(resp.get('cursor', ''))
-" 2>/dev/null)
-
-        [ -z "$cursor" ] && break
-    done
-    return 0
-}
-
-# Generate list of users we follow who don't follow us back
-atproto_generate_unfollow_list() {
-    local output_file="${1:-remove_list.txt}"
-    local out_type="${2:-handle}"
-    local per_page="${3:-100}"
-
-    if [ "$out_type" != "handle" ] && [ "$out_type" != "did" ]; then
-        error "Invalid format: $out_type. Must be 'handle' or 'did'"
-        return 1
-    fi
-
-    local actor
-    actor=$(get_session_did) || {
-        error "Failed to determine session DID. Please login."
-        return 1
-    }
-
-    echo "Fetching data for: $actor" >&2
-
-    local followers_file="/tmp/followers_$$.txt"
-    local following_file="/tmp/following_$$.txt"
-
-    fetch_paginated_list "/xrpc/app.bsky.graph.getFollowers?actor=$actor&limit=$per_page" "followers" "$out_type" > "$followers_file"
-    fetch_paginated_list "/xrpc/app.bsky.graph.getFollows?actor=$actor&limit=$per_page" "follows" "$out_type" > "$following_file"
-
-    python3 -c "
-following = set(open('$following_file').read().strip().split('\n'))
-followers = set(open('$followers_file').read().strip().split('\n'))
-no_follow_back = following - followers
-for user in sorted(no_follow_back):
-    if user: print(user)
-" > "$output_file"
-
-    rm -f "$followers_file" "$following_file"
-    local count=$(wc -l < "$output_file")
-    echo "Found $count users who don't follow back" >&2
-    echo "List saved to: $output_file" >&2
-    return 0
-}
-
-# Main unfollow function with progress tracking
-atproto_unfollow_no_follows() {
-    local dry_run=true
-    local report_file=""
-    local resume=false
-    local yes_flag=false
-    local throttle=1
-    local limit=0
-
-    # Parse options
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --dry-run) dry_run=true; shift ;;
-            --no-dry-run|--exec) dry_run=false; shift ;;
-            --report-file) report_file="$2"; shift 2 ;;
-            --resume) resume=true; shift ;;
-            -y|--yes) yes_flag=true; shift ;;
-            --throttle) throttle="$2"; shift 2 ;;
-            --limit) limit="$2"; shift 2 ;;
-            *) error "Unknown option: $1"; return 1 ;;
-        esac
-    done
-
-    local actor
-    actor=$(get_session_did) || {
-        error "Failed to determine session DID. Please login."
-        return 1
-    }
-
-    echo "Fetching data for: $actor"
-
-    # Get followers and following with DID+handle pairs
-    local followers_file="/tmp/followers_$$.txt"
-    local following_file="/tmp/following_$$.txt"
-
-    fetch_paginated_list "/xrpc/app.bsky.graph.getFollowers?actor=$actor&limit=100" "followers" "did" > "$followers_file"
-    fetch_paginated_list "/xrpc/app.bsky.graph.getFollows?actor=$actor&limit=100" "follows" "both" > "$following_file"
-
-    # Build follow map: DID -> rkey
-    echo "Building follow map..."
-    declare -A follow_map
-    while IFS=$'\t' read -r did rkey; do
-        follow_map["$did"]="$rkey"
-    done < <(build_follow_record_map)
-
-    # Find users to unfollow
-    local candidates_file="/tmp/unfollow_candidates_$$.txt"
-    python3 -c "
-followers = set(line.strip() for line in open('$followers_file'))
-following_list = []
-for line in open('$following_file'):
-    if '\t' in line:
-        did, handle = line.strip().split('\t', 1)
-        following_list.append((did, handle))
-
-for did, handle in following_list:
-    if did not in followers:
-        print(f'{did}\t{handle}')
-" > "$candidates_file"
-
-    local total=$(wc -l < "$candidates_file")
-    [ "$limit" -gt 0 ] && [ "$total" -gt "$limit" ] && total=$limit
-    
-    echo "Found $total users"
-
-    # Handle resume mode
-    local processed_dids=""
-    if [ "$resume" = true ] && [ -n "$report_file" ] && [ -f "$report_file" ]; then
-        processed_dids=$(awk -F, 'NR>1 {print $1}' "$report_file" | sort -u | tr '\n' '|')
-        processed_dids="${processed_dids%|}"
-    fi
-
-    # Initialize report file
-    if [ -n "$report_file" ] && [ ! -f "$report_file" ]; then
-        echo "did,handle,action,result,timestamp" > "$report_file"
-    fi
-
-    # Progress tracking
-    local count=0
-    local success=0
-    local failed=0
-    local skipped=0
-    local start_time=$(date +%s)
-
-    # Process each candidate
-    while IFS=$'\t' read -r did handle; do
-        [ "$count" -ge "$total" ] && break
-
-        # Skip if already processed
-        if [ -n "$processed_dids" ] && echo "$did" | grep -qE "^($processed_dids)$"; then
-            ((skipped++))
-            continue
-        fi
-
-        ((count++))
-        
-        # Calculate progress
-        local pct=$((count * 100 / total))
-        local bar_width=40
-        local filled=$((pct * bar_width / 100))
-        local empty=$((bar_width - filled))
-        local bar=$(printf "%${filled}s" | tr ' ' '#')$(printf "%${empty}s" | tr ' ' '-')
-        
-        # Calculate ETA
-        local elapsed=$(($(date +%s) - start_time))
-        local avg_time=$((elapsed / count))
-        local remaining=$((total - count))
-        local eta=$((remaining * avg_time))
-        local eta_str=$(printf "%02d:%02d:%02d" $((eta/3600)) $((eta%3600/60)) $((eta%60)))
-
-        printf "\r[%s] %3d%% ETA:%s | ✓:%d ✗:%d ⊙:%d | %-25s" \
-            "$bar" "$pct" "$eta_str" "$success" "$failed" "$skipped" "${handle:0:25}"
-
-        # Execute or dry-run
-        if [ "$dry_run" = true ]; then
-            ((skipped++))
-            [ -n "$report_file" ] && echo "$did,$handle,unfollow,dry-run,$(date -Iseconds)" >> "$report_file"
-        else
-            local rkey="${follow_map[$did]}"
-            if [ -z "$rkey" ]; then
-                ((failed++))
-                [ -n "$report_file" ] && echo "$did,$handle,unfollow,failed-no-rkey,$(date -Iseconds)" >> "$report_file"
-                continue
-            fi
-
-            if atproto_unfollow_by_rkey "$rkey"; then
-                ((success++))
-                [ -n "$report_file" ] && echo "$did,$handle,unfollow,success,$(date -Iseconds)" >> "$report_file"
-            else
-                ((failed++))
-                [ -n "$report_file" ] && echo "$did,$handle,unfollow,failed,$(date -Iseconds)" >> "$report_file"
-            fi
-            sleep "$throttle"
-        fi
-    done < "$candidates_file"
-
-    echo
-    if [ "$dry_run" = true ]; then
-        echo "[DRY-RUN] $success users (skip: $skipped)"
-    else
-        echo "Unfollowed: $success | Failed: $failed | Skipped: $skipped"
-    fi
-
-    rm -f "$followers_file" "$following_file" "$candidates_file"
     return 0
 }
