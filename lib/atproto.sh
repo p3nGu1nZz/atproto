@@ -3049,7 +3049,7 @@ atproto_unfollow_no_follows() {
         return 1
     }
 
-    echo "Fetching data for: $actor"
+    echo "Fetching data for: $actor" >&2
 
     # Get followers and following with DID+handle pairs
     local followers_file="/tmp/followers_$$.txt"
