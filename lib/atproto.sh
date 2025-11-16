@@ -2885,8 +2885,10 @@ fetch_paginated_list() {
     local endpoint_base="$1"
     local list_key="$2"
     local out_type="${3:-handle}"
+    local show_progress="${4:-false}"  # Optional: show progress dots
     local cursor=""
     local access_token
+    local page_count=0
     access_token=$(get_access_token) || return 1
 
     while true; do
@@ -2895,6 +2897,11 @@ fetch_paginated_list() {
         
         local response
         response=$(api_request GET "$endpoint" "" "$access_token") || return 1
+        
+        ((page_count++))
+        if [ "$show_progress" = "true" ] && [ $((page_count % 10)) -eq 0 ]; then
+            echo -n "." >&2
+        fi
 
         # Output based on type
         if [ "$out_type" = "both" ]; then
@@ -3048,15 +3055,29 @@ atproto_unfollow_no_follows() {
     local followers_file="/tmp/followers_$$.txt"
     local following_file="/tmp/following_$$.txt"
 
-    fetch_paginated_list "/xrpc/app.bsky.graph.getFollowers?actor=$actor&limit=100" "followers" "did" > "$followers_file"
-    fetch_paginated_list "/xrpc/app.bsky.graph.getFollows?actor=$actor&limit=100" "follows" "both" > "$following_file"
+    echo -n "Fetching followers..." >&2
+    fetch_paginated_list "/xrpc/app.bsky.graph.getFollowers?actor=$actor&limit=100" "followers" "did" "false" > "$followers_file"
+    local followers_count=$(wc -l < "$followers_file")
+    echo " $followers_count found" >&2
+    
+    echo -n "Fetching following (this may take a minute for large accounts)" >&2
+    fetch_paginated_list "/xrpc/app.bsky.graph.getFollows?actor=$actor&limit=100" "follows" "both" "true" > "$following_file"
+    local following_count=$(wc -l < "$following_file")
+    echo " $following_count found" >&2
 
     # Build follow map: DID -> rkey
-    echo "Building follow map..."
+    echo "Building follow map (processing ~$following_count follow records, may take 1-2 minutes)..."
     declare -A follow_map
+    local map_count=0
     while IFS=$'\t' read -r did rkey; do
         follow_map["$did"]="$rkey"
+        ((map_count++))
+        # Show progress every 1000 records
+        if [ $((map_count % 1000)) -eq 0 ]; then
+            echo "  Processed $map_count follow records..."
+        fi
     done < <(build_follow_record_map)
+    echo "Follow map complete: $map_count records indexed"
 
     # Find users to unfollow
     local candidates_file="/tmp/unfollow_candidates_$$.txt"
