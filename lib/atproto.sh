@@ -3100,7 +3100,7 @@ for did, handle in following_list:
             fi
             sleep "$throttle"
         fi
-    done < "$candidates_file"
+    done < "$candidates_file" || true
 
     echo
     if [ "$dry_run" = true ]; then
