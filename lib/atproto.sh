@@ -1528,6 +1528,53 @@ atproto_like() {
         error "Failed to get access token"
         return 1
     }
+
+# Unfollow a user by rkey (more efficient when rkey is already known)
+# Arguments:
+#   $1 - rkey of the follow record
+# Returns:
+#   0 - Success
+#   1 - Failure
+atproto_unfollow_by_rkey() {
+    local rkey="$1"
+    
+    if [ -z "$rkey" ]; then
+        error "Record key (rkey) is required"
+        return 1
+    fi
+    
+    # Check if logged in
+    if [ ! -f "$SESSION_FILE" ]; then
+        error "Not logged in"
+        return 1
+    fi
+    
+    local access_token session_data repo
+    access_token=$(get_access_token) || return 1
+    session_data=$(cat "$SESSION_FILE")
+    repo=$(json_get_field "$session_data" "did")
+    
+    # Delete the follow record
+    local delete_data
+    delete_data=$(cat <<EOF
+{
+    "repo": "$repo",
+    "collection": "app.bsky.graph.follow",
+    "rkey": "$rkey"
+}
+EOF
+)
+    
+    local response
+    response=$(api_request POST "/xrpc/com.atproto.repo.deleteRecord" "$delete_data" "$access_token")
+    
+    # Check for errors
+    if echo "$response" | grep -q '"error"'; then
+        return 1
+    fi
+    
+    return 0
+}
     
     # Get session data for repo
     local session_data repo
